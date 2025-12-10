@@ -46,87 +46,112 @@ function initAuth() {
     const btnLogin = document.getElementById("btn-login");
     const btnSignup = document.getElementById("btn-signup");
     try {
-      btnLogin.disabled = true; btnSignup.disabled = true; clearAlert();
-      const email = emailEl.value.trim(); const password = passEl.value;
-      if (!email || !password){ setAlert("Enter email and password"); return; }
+      btnLogin.disabled = true;
+      btnSignup.disabled = true;
+      clearAlert();
+
+      const email = emailEl.value.trim();
+      const password = passEl.value;
+      if (!email || !password) {
+        setAlert("Enter email and password");
+        return;
+      }
+
       setAlert("Signing in...");
       const { data, error } = await client.auth.signInWithPassword({ email, password });
-      if (error) { setAlert(error.message || "Login failed"); return; }
-      if (data && data.session) {
-        setAlert("Logged in", true);
-        await ensureProfile();
-        showApp();
-        await loadDocuments();
-        initRealtime();
-      } else {
-        const sess = await awaitSession(4000, 200);
-        if (sess) {
-          setAlert("Logged in", true);
-          await ensureProfile();
-          showApp();
-          await loadDocuments();
-          initRealtime();
-        } else {
-          setAlert("Login did not start a session");
-        }
+
+      if (error) {
+        setAlert(error.message || "Login failed");
+        return;
       }
+
+      // Successful login; onAuthStateChange will handle loading profile, documents, and realtime
+      setAlert("Logged in", true);
     } catch (err) {
       setAlert((err && err.message) ? err.message : "Unexpected error during login");
     } finally {
-      btnLogin.disabled=false; btnSignup.disabled=false;
+      btnLogin.disabled = false;
+      btnSignup.disabled = false;
     }
   });
   document.getElementById("btn-signup").addEventListener("click", async () => {
     const btnLogin = document.getElementById("btn-login");
     const btnSignup = document.getElementById("btn-signup");
     try {
-      btnLogin.disabled = true; btnSignup.disabled = true; clearAlert();
-      const email = emailEl.value.trim(); const password = passEl.value;
-      if (!email || !password){ setAlert("Enter email and password"); return; }
+      btnLogin.disabled = true;
+      btnSignup.disabled = true;
+      clearAlert();
+
+      const email = emailEl.value.trim();
+      const password = passEl.value;
+      if (!email || !password) {
+        setAlert("Enter email and password");
+        return;
+      }
+
       const proto = window.location.protocol;
       const redirectTo = proto.startsWith("http") ? window.location.origin : undefined;
-      const { data, error } = await client.auth.signUp({ email, password, options: redirectTo ? { emailRedirectTo: redirectTo } : {} });
-      if (error) { setAlert(error.message || "Sign up failed"); return; }
-      if (data.session) { setAlert("Signed up and logged in", true); }
-      else {
-        if (proto === "file:") setAlert("Email confirmation required. Serve over http://localhost and retry.");
-        else {
-          setAlert("Check email to confirm before login", true);
-          const retry = await client.auth.signInWithPassword({ email, password });
-          let hasSession = !retry.error && retry.data && retry.data.session;
-          if (!hasSession) {
-            const sess = await awaitSession(4000, 200);
-            hasSession = !!sess;
-          }
-          if (hasSession) {
-            setAlert("Logged in", true);
-            await ensureProfile();
-            showApp();
-            await loadDocuments();
-            initRealtime();
-          }
+
+      const { data, error } = await client.auth.signUp({
+        email,
+        password,
+        options: redirectTo ? { emailRedirectTo: redirectTo } : {}
+      });
+
+      if (error) {
+        setAlert(error.message || "Sign up failed");
+        return;
+      }
+
+      if (data && data.session) {
+        // In some configurations, Supabase returns an active session immediately
+        setAlert("Signed up and logged in", true);
+        // onAuthStateChange will run the rest of the app bootstrap
+      } else {
+        // Most email-confirmation setups will not return a session immediately
+        if (proto === "file:") {
+          setAlert("Email confirmation required. Serve over http://localhost and retry.");
+        } else {
+          setAlert("Sign up successful. Check your email to confirm before logging in.", true);
         }
       }
     } catch (err) {
       setAlert((err && err.message) ? err.message : "Unexpected error during signup");
     } finally {
-      btnLogin.disabled=false; btnSignup.disabled=false;
+      btnLogin.disabled = false;
+      btnSignup.disabled = false;
     }
   });
   client.auth.onAuthStateChange(async (event, session) => {
     state.session = session;
-    if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED" || event === "USER_UPDATED") {
+
+    // Handle initial session load, fresh sign-ins, token refreshes, and user updates
+    if (
+      event === "INITIAL_SESSION" ||
+      event === "SIGNED_IN" ||
+      event === "TOKEN_REFRESHED" ||
+      event === "USER_UPDATED"
+    ) {
       clearAlert();
-      await ensureProfile();
       showApp();
-      await loadDocuments();
-      initRealtime();
+      try {
+        await Promise.all([
+          ensureProfile(),
+          loadDocuments()
+        ]);
+        initRealtime();
+      } catch (err) {
+        console.error("Error during post-auth initialization:", err);
+      }
       return;
     }
+
     if (event === "SIGNED_OUT") {
       showAuth();
       return;
     }
+
+    // Fallback: if we have a session but no explicit event, show the app shell
     if (session) {
       showApp();
     } else {
@@ -136,11 +161,9 @@ function initAuth() {
   client.auth.getSession().then(({ data }) => {
     state.session = data.session;
     if (state.session) {
-      ensureProfile().then(() => {
-        showApp();
-        loadDocuments();
-        initRealtime();
-      });
+      // Let onAuthStateChange("INITIAL_SESSION") perform the heavy loading;
+      // just show the app shell here.
+      showApp();
     } else {
       showAuth();
     }
