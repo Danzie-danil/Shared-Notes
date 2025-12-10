@@ -11,12 +11,13 @@ const state = {
   latestByDoc: {},
   selectedDocumentId: null,
   entries: [],
-  filters: { chip: "All", search: "" },
+  filters: { chip: "All", search: "", groupDocIds: null },
   channels: { docs: null, entries: null },
   autoScroll: true,
   editingEntryId: null,
   titleEditing: false,
-  currentTab: "Notes"
+  currentTab: "Notes",
+  groups: []
 };
 
 function initAuth() {
@@ -247,6 +248,7 @@ function renderDocumentsList() {
     const text = ((d.title || "") + " " + (latest ? (latest.author_name + ": " + (latest.content || "")) : "")).toLowerCase();
     const s = state.filters.search.toLowerCase();
     if (s && !text.includes(s)) return false;
+    if (state.filters.groupDocIds && !state.filters.groupDocIds.includes(d.id)) return false;
     if (state.filters.chip === "Mine" && d.created_by !== state.session.user.id) return false;
     if (state.filters.chip === "Shared" && d.created_by === state.session.user.id) return false;
     if (state.filters.chip === "Today") {
@@ -322,7 +324,7 @@ function handleEntryRealtime(payload) {
   const list = document.getElementById("entries-list");
   const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
   renderEntriesList();
-  if (nearBottom) list.scrollTop = list.scrollHeight;
+  if (nearBottom || state.autoScroll) list.scrollTop = list.scrollHeight;
 }
 
 async function loadEntries(documentId) {
@@ -507,6 +509,7 @@ function bindUI() {
       document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
       e.target.classList.add("active");
       state.filters.chip = e.target.dataset.chip;
+      state.filters.groupDocIds = null;
       renderDocumentsList();
     }
   });
@@ -571,6 +574,7 @@ function sameWeek(a, b) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  loadPreferences();
   bindUI();
   initAuth();
 });
@@ -625,4 +629,241 @@ function navigate(tab) {
     if (btn) btn.classList.toggle("active", t === tab);
   }
   document.getElementById("menu-panel").classList.add("hidden");
+  if (tab === "Activity") renderActivityView();
+  if (tab === "Groups") renderGroupsView();
+  if (tab === "Settings") renderSettingsView();
+}
+
+async function renderActivityView() {
+  const container = document.getElementById("view-activity");
+  container.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.style.padding = "12px";
+  const title = document.createElement("div");
+  title.style.fontWeight = "700";
+  title.style.marginBottom = "8px";
+  title.textContent = "Recent Entries";
+  wrap.appendChild(title);
+  const { data: recent } = await client.from("entries").select("id,document_id,author_name,author_color,content,created_at").order("created_at", { ascending: false }).limit(50);
+  const ul = document.createElement("ul");
+  ul.style.listStyle = "none";
+  ul.style.margin = "0";
+  ul.style.padding = "0";
+  const docMap = new Map(state.documents.map(d => [d.id, d]));
+  (recent || []).forEach(e => {
+    const li = document.createElement("li");
+    li.className = "entry";
+    li.style.cursor = "pointer";
+    const top = document.createElement("div");
+    top.className = "entry-top";
+    const badge = document.createElement("div");
+    badge.className = "author-badge";
+    const dot = document.createElement("span");
+    dot.style.width = "10px";
+    dot.style.height = "10px";
+    dot.style.borderRadius = "999px";
+    dot.style.background = e.author_color || "#888";
+    const name = document.createElement("span");
+    name.textContent = e.author_name || "Author";
+    badge.appendChild(dot);
+    badge.appendChild(name);
+    const time = document.createElement("div");
+    time.className = "entry-time";
+    time.textContent = humanizeTime(new Date(e.created_at));
+    top.appendChild(badge);
+    top.appendChild(time);
+    li.appendChild(top);
+    const content = document.createElement("div");
+    content.className = "entry-content";
+    const doc = docMap.get(e.document_id);
+    content.textContent = (doc ? (doc.title || "Untitled") + " – " : "") + (e.content || "");
+    li.appendChild(content);
+    li.addEventListener("click", () => openDocument(e.document_id));
+    ul.appendChild(li);
+  });
+  wrap.appendChild(ul);
+  container.appendChild(wrap);
+}
+
+function loadGroups() {
+  try {
+    const raw = localStorage.getItem("sn_groups");
+    state.groups = raw ? JSON.parse(raw) : [];
+  } catch (_) { state.groups = []; }
+}
+
+function saveGroups() {
+  try { localStorage.setItem("sn_groups", JSON.stringify(state.groups)); } catch (_) {}
+}
+
+function renderGroupsView() {
+  loadGroups();
+  const container = document.getElementById("view-groups");
+  container.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.style.padding = "12px";
+  const h = document.createElement("div");
+  h.style.fontWeight = "700";
+  h.style.marginBottom = "8px";
+  h.textContent = "Groups";
+  wrap.appendChild(h);
+
+  const smart = document.createElement("div");
+  smart.style.display = "grid";
+  smart.style.gridTemplateColumns = "1fr 1fr";
+  smart.style.gap = "8px";
+  const btnToday = document.createElement("button");
+  btnToday.className = "btn";
+  btnToday.textContent = "Active Today";
+  btnToday.addEventListener("click", () => { navigate("Notes"); state.filters.chip = "Today"; renderDocumentsList(); });
+  const btnWeek = document.createElement("button");
+  btnWeek.className = "btn";
+  btnWeek.textContent = "This Week";
+  btnWeek.addEventListener("click", () => { navigate("Notes"); state.filters.chip = "This Week"; renderDocumentsList(); });
+  smart.appendChild(btnToday);
+  smart.appendChild(btnWeek);
+  wrap.appendChild(smart);
+
+  const form = document.createElement("div");
+  form.style.marginTop = "12px";
+  const nameInput = document.createElement("input");
+  nameInput.className = "field";
+  nameInput.placeholder = "New group name";
+  const docsList = document.createElement("div");
+  docsList.style.display = "grid";
+  docsList.style.gridTemplateColumns = "1fr 1fr";
+  docsList.style.gap = "6px";
+  state.documents.forEach(d => {
+    const label = document.createElement("label");
+    label.style.display = "flex";
+    label.style.alignItems = "center";
+    label.style.gap = "6px";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = d.id;
+    const span = document.createElement("span");
+    span.textContent = d.title || "Untitled";
+    label.appendChild(cb);
+    label.appendChild(span);
+    docsList.appendChild(label);
+  });
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "btn primary";
+  saveBtn.textContent = "Save Group";
+  saveBtn.style.marginTop = "8px";
+  saveBtn.addEventListener("click", () => {
+    const name = nameInput.value.trim();
+    if (!name) return;
+    const selected = Array.from(docsList.querySelectorAll('input[type="checkbox"]:checked')).map(x => x.value);
+    if (!selected.length) return;
+    state.groups.push({ id: String(Date.now()), name, docIds: selected });
+    saveGroups();
+    renderGroupsView();
+  });
+  form.appendChild(nameInput);
+  form.appendChild(docsList);
+  form.appendChild(saveBtn);
+  wrap.appendChild(form);
+
+  const listTitle = document.createElement("div");
+  listTitle.style.fontWeight = "700";
+  listTitle.style.margin = "12px 0 6px";
+  listTitle.textContent = "Saved Groups";
+  wrap.appendChild(listTitle);
+  const gl = document.createElement("div");
+  gl.style.display = "flex";
+  gl.style.flexDirection = "column";
+  gl.style.gap = "8px";
+  state.groups.forEach(g => {
+    const row = document.createElement("div");
+    row.className = "entry";
+    const top = document.createElement("div");
+    top.className = "entry-top";
+    const name = document.createElement("div");
+    name.textContent = g.name;
+    const count = document.createElement("div");
+    count.className = "entry-time";
+    count.textContent = String(g.docIds.length) + " docs";
+    top.appendChild(name);
+    top.appendChild(count);
+    row.appendChild(top);
+    const actions = document.createElement("div");
+    actions.className = "entry-actions-row";
+    const openBtn = document.createElement("button");
+    openBtn.className = "btn";
+    openBtn.textContent = "Open";
+    openBtn.addEventListener("click", () => { state.filters.groupDocIds = g.docIds; navigate("Notes"); renderDocumentsList(); });
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn";
+    delBtn.textContent = "Delete";
+    delBtn.addEventListener("click", () => { state.groups = state.groups.filter(x => x.id !== g.id); saveGroups(); renderGroupsView(); });
+    actions.appendChild(openBtn);
+    actions.appendChild(delBtn);
+    row.appendChild(actions);
+    gl.appendChild(row);
+  });
+  wrap.appendChild(gl);
+  container.appendChild(wrap);
+}
+
+async function renderSettingsView() {
+  const container = document.getElementById("view-settings");
+  container.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.style.padding = "12px";
+  const h = document.createElement("div");
+  h.style.fontWeight = "700";
+  h.style.marginBottom = "8px";
+  h.textContent = "Settings";
+  wrap.appendChild(h);
+  const prof = state.profile;
+  const nameInput = document.createElement("input");
+  nameInput.className = "field";
+  nameInput.placeholder = "Display name";
+  nameInput.value = prof && prof.display_name ? prof.display_name : "";
+  const colorInput = document.createElement("input");
+  colorInput.type = "color";
+  colorInput.style.marginTop = "8px";
+  colorInput.value = prof && prof.color ? prof.color : "#25D366";
+  const saveProfile = document.createElement("button");
+  saveProfile.className = "btn primary";
+  saveProfile.style.marginTop = "8px";
+  saveProfile.textContent = "Save Profile";
+  saveProfile.addEventListener("click", async () => {
+    if (!state.session) return;
+    await client.from("users").update({ display_name: nameInput.value.trim(), color: colorInput.value }).eq("id", state.session.user.id);
+    await ensureProfile();
+    renderSettingsView();
+  });
+  wrap.appendChild(nameInput);
+  wrap.appendChild(colorInput);
+  wrap.appendChild(saveProfile);
+
+  const autoRow = document.createElement("div");
+  autoRow.style.display = "flex";
+  autoRow.style.alignItems = "center";
+  autoRow.style.gap = "8px";
+  autoRow.style.marginTop = "12px";
+  const autoLabel = document.createElement("span");
+  autoLabel.textContent = "Auto-scroll to newest entry";
+  const autoChk = document.createElement("input");
+  autoChk.type = "checkbox";
+  autoChk.checked = !!state.autoScroll;
+  autoChk.addEventListener("change", () => { state.autoScroll = !!autoChk.checked; try { localStorage.setItem("sn_auto_scroll", state.autoScroll ? "1" : "0"); } catch (_) {} });
+  autoRow.appendChild(autoChk);
+  autoRow.appendChild(autoLabel);
+  wrap.appendChild(autoRow);
+
+  const info = document.createElement("div");
+  info.style.color = "#9aa0a6";
+  info.style.fontSize = "13px";
+  info.style.marginTop = "12px";
+  info.textContent = "Mobile input zoom is disabled and positions are fixed for stability.";
+  wrap.appendChild(info);
+
+  container.appendChild(wrap);
+}
+
+function loadPreferences() {
+  try { state.autoScroll = localStorage.getItem("sn_auto_scroll") === "0" ? false : true; } catch (_) {}
 }
