@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div id="toast" class="toast hidden"></div>
 <div id="auth-screen" class="screen">
   <div class="auth-card">
     <div class="app-logo">Shared Notes</div>
@@ -31,6 +32,7 @@
       <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
     </button>
     <div class="top-actions">
+      <select id="team-selector" class="field" style="width:160px"></select>
       <button id="btn-home" class="icon-btn">
         <svg viewBox="0 0 24 24"><path d="M12 3l9 8h-3v10H6V11H3l9-8z"/></svg>
       </button>
@@ -43,7 +45,7 @@
     </div>
   </div>
   <div id="menu-panel" class="menu-panel hidden">
-    <button id="menu-new-doc" class="menu-item">New Document</button>
+    <button id="menu-new-doc" class="menu-item">New Notebook</button>
     <button id="menu-signout" class="menu-item">Sign Out</button>
   </div>
 
@@ -81,7 +83,7 @@
   <div class="bottom-nav">
     <button id="nav-notes" class="nav-btn active">
       <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg>
-      <span>Notes</span>
+      <span>Notebooks</span>
     </button>
     <button id="nav-activity" class="nav-btn">
       <svg viewBox="0 0 24 24"><path d="M12 2l9 9-9 9-9-9 9-9z"/></svg>
@@ -108,7 +110,7 @@
       </button>
     </div>
     <div class="doc-title-edit">
-      <input id="document-title-input" class="doc-title-input hidden" type="text" placeholder="Rename document">
+      <input id="document-title-input" class="doc-title-input hidden" type="text" placeholder="Rename notebook">
       <div id="document-title-actions" class="doc-title-actions hidden">
         <button id="title-cancel" class="btn">Cancel</button>
         <button id="title-save" class="btn primary">Save</button>
@@ -117,10 +119,13 @@
     <div id="doc-info-panel" class="doc-info-panel hidden"></div>
     <div id="entries-list" class="entries-list"></div>
     <div class="entry-input">
+      <div id="pending-files" class="placeholder hidden"></div>
       <textarea id="entry-text" rows="2" placeholder="Write a new entry..."></textarea>
       <div id="entry-error" class="alert hidden"></div>
       <div class="entry-actions">
         <span id="char-count">0</span>
+        <input id="attach-file-input" type="file" class="hidden" />
+        <button id="btn-attach-file" class="btn">Attach file</button>
         <button id="btn-add-entry" class="btn primary">Add Entry</button>
       </div>
     </div>
@@ -128,8 +133,8 @@
 
   <div id="new-doc-modal" class="modal hidden">
     <div class="modal-card">
-      <div class="modal-title">New Document</div>
-      <input id="new-doc-title" class="field" type="text" placeholder="Document title">
+      <div class="modal-title">New Notebook</div>
+      <input id="new-doc-title" class="field" type="text" placeholder="Notebook title">
       <div id="new-doc-error" class="alert hidden"></div>
       <div class="modal-actions">
         <button id="new-doc-cancel" class="btn">Cancel</button>

@@ -1,7 +1,14 @@
 const SUPABASE_URL = "https://oafywoleknpytawuvcit.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9hZnl3b2xla25weXRhd3V2Y2l0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUzMDY3MzEsImV4cCI6MjA4MDg4MjczMX0.j7UOKGI6SVpUe_o0NyEgXwDL_4_MnIkV7yjTPCO5848";
 const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: { persistSession: true, autoRefreshToken: true }
+  auth: {
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
+    multiTab: true,
+    storageKey: "sn-auth-token",
+    storage: window.localStorage
+  }
 });
 
 const state = {
@@ -22,6 +29,7 @@ const state = {
   tags: {},
   reactions: {},
   activityFilters: { mine: false, range: null },
+  activityDocId: null,
   lastOpened: {},
   compact: false,
   confirmDelete: false,
@@ -99,13 +107,12 @@ function initAuth() {
         return;
       }
 
-      const proto = window.location.protocol;
-      const redirectTo = proto.startsWith("http") ? window.location.origin : undefined;
+      const origin = window.location.protocol.startsWith("http") ? window.location.origin : "http://localhost:8000";
 
       const { data, error } = await client.auth.signUp({
         email,
         password,
-        options: redirectTo ? { emailRedirectTo: redirectTo } : {}
+        options: { emailRedirectTo: origin }
       });
 
       if (error) {
@@ -118,11 +125,34 @@ function initAuth() {
         setAlert("Signed up and logged in", true);
         // onAuthStateChange will run the rest of the app bootstrap
       } else {
-        // Most email-confirmation setups will not return a session immediately
-        if (proto === "file:") {
-          setAlert("Email confirmation required. Serve over http://localhost and retry.");
+        // Try direct sign-in (works when email confirmation is disabled)
+        const { data: signinData, error: signinErr } = await client.auth.signInWithPassword({ email, password });
+        if (!signinErr && signinData && signinData.session) {
+          setAlert("Signed up and logged in", true);
         } else {
-          setAlert("Sign up successful. Check your email to confirm before logging in.", true);
+          // Resend confirmation email as a fallback
+          try {
+            const { error: resendErr } = await client.auth.resend({ type: "signup", email, options: { emailRedirectTo: origin } });
+            if (resendErr) console.error("Resend confirmation error", resendErr);
+          } catch (e) { console.error("Resend confirmation exception", e); }
+          setAlert("Sign up successful. Confirmation email sent. If you don't receive it, disable 'Confirm email' or configure SMTP in Supabase Auth.", true);
+          let btnResend = document.getElementById("btn-resend-confirm");
+          if (!btnResend) {
+            btnResend = document.createElement("button");
+            btnResend.id = "btn-resend-confirm";
+            btnResend.className = "btn";
+            btnResend.textContent = "Resend confirmation";
+            const actions = document.querySelector(".auth-actions");
+            if (actions) actions.appendChild(btnResend);
+          }
+          btnResend.onclick = async () => {
+            btnResend.disabled = true; btnResend.textContent = "Resending...";
+            try {
+              const { error: resendErr2 } = await client.auth.resend({ type: "signup", email, options: { emailRedirectTo: origin } });
+              if (resendErr2) { setAlert(resendErr2.message || "Resend failed"); console.error("Resend error", resendErr2); }
+              else { setAlert("Confirmation email resent.", true); }
+            } finally { btnResend.disabled = false; btnResend.textContent = "Resend confirmation"; }
+          };
         }
       }
     } catch (err) {
@@ -136,25 +166,26 @@ function initAuth() {
     state.session = session;
 
     // Handle initial session load, fresh sign-ins, token refreshes, and user updates
-    if (
-      event === "INITIAL_SESSION" ||
-      event === "SIGNED_IN" ||
-      event === "TOKEN_REFRESHED" ||
-      event === "USER_UPDATED"
-    ) {
-      clearAlert();
-      showApp();
-      try {
-        await Promise.all([
-          ensureProfile(),
-          loadDocuments()
-        ]);
-        initRealtime();
-      } catch (err) {
-        console.error("Error during post-auth initialization:", err);
-      }
-      return;
+  if (
+    event === "INITIAL_SESSION" ||
+    event === "SIGNED_IN" ||
+    event === "TOKEN_REFRESHED" ||
+    event === "USER_UPDATED"
+  ) {
+    clearAlert();
+    showApp();
+    try {
+      await Promise.all([
+        ensureProfile(),
+        loadTeams(),
+        loadDocuments()
+      ]);
+      initRealtime();
+    } catch (err) {
+      console.error("Error during post-auth initialization:", err);
     }
+    return;
+  }
 
     if (event === "SIGNED_OUT") {
       showAuth();
@@ -191,7 +222,10 @@ async function ensureProfile() {
     if (!existing) {
       const name = email ? email.split("@")[0] : "User";
       const color = randomColor();
-      await client.from("users").insert({ id: uid, display_name: name, color });
+      await client.from("users").insert({ id: uid, display_name: name, color, email });
+    }
+    else if (!existing.email && email) {
+      await client.from("users").update({ email }).eq("id", uid);
     }
     const { data: profile } = await client.from("users").select("*").eq("id", uid).maybeSingle();
     state.profile = profile;
@@ -202,7 +236,7 @@ function initRealtime() {
   if (state.channels.docs) state.channels.docs.unsubscribe();
   state.channels.docs = client.channel("docs").on(
     "postgres_changes",
-    { event: "*", schema: "public", table: "documents" },
+    { event: "*", schema: "public", table: "notebooks" },
     async () => { await loadDocuments(); }
   ).subscribe();
 }
@@ -219,17 +253,21 @@ function showApp() {
 }
 
 async function loadDocuments() {
-  const { data: docs } = await client.from("documents").select("id,title,created_by,created_at,updated_at").order("updated_at", { ascending: false });
-  state.documents = docs || [];
+  try {
+  let q = client.from("notebooks").select("id,title,created_by,created_at,updated_at,team_id").order("updated_at", { ascending: false });
+    if (state.currentTeamId) q = q.eq("team_id", state.currentTeamId);
+    const { data: docs, error } = await q;
+    if (error) { console.error("loadDocuments error", error); state.documents = []; }
+    else { state.documents = docs || []; }
+  } catch (err) { console.error("loadDocuments exception", err); state.documents = []; }
   const ids = state.documents.map(d => d.id);
   state.latestByDoc = {};
   if (ids.length) {
-    const { data: latest } = await client.from("entries").select("id,document_id,author_name,content,created_at").in("document_id", ids).order("created_at", { ascending: false });
-    if (latest) {
-      for (const e of latest) {
-        if (!state.latestByDoc[e.document_id]) state.latestByDoc[e.document_id] = e;
-      }
-    }
+    try {
+    const { data: latest, error } = await client.from("entries").select("id,notebook_id,author_name,content,created_at").in("notebook_id", ids).order("created_at", { ascending: false });
+      if (error) { console.error("loadDocuments latest entries error", error); }
+      else if (latest) { for (const e of latest) { if (!state.latestByDoc[e.notebook_id]) state.latestByDoc[e.notebook_id] = e; } }
+    } catch (err) { console.error("loadDocuments latest entries exception", err); }
   }
   renderDocumentsList();
 }
@@ -237,18 +275,49 @@ async function loadDocuments() {
 async function createDocument() {
   const title = prompt("New document title");
   if (!title) return;
-  await client.from("documents").insert({ title });
+  await client.from("notebooks").insert({ title });
 }
 
 async function createDocumentInline(title) {
   const uid = (state.session && state.session.user && state.session.user.id) ? state.session.user.id : (await awaitSession())?.user?.id;
   if (!uid) return { error: { message: "Sign in to create documents" } };
-  const payload = { title, created_by: uid, updated_at: new Date().toISOString() };
-  const { data, error } = await client.from("documents").insert(payload).select("*").single();
-  if (error) return { error };
+  const payload = { title, created_by: uid, updated_at: new Date().toISOString(), team_id: state.currentTeamId || null };
+  const { data, error } = await client.from("notebooks").insert(payload).select("id").single();
+  if (error) { console.error("createDocumentInline error", error); return { error } }
+  if (data && data.id) {
+    const { error: memberErr } = await client.from("notebook_members").insert({ notebook_id: data.id, user_id: uid, role: "owner" });
+    if (memberErr) console.error("createDocumentInline membership insert error", memberErr);
+  }
   await loadDocuments();
-  if (data && data.id) await openDocument(data.id);
+  let id = data && data.id ? data.id : null;
+  if (!id) {
+    const own = state.documents.filter(d => d.created_by === uid);
+    const match = own.find(d => (d.title || "") === title);
+    const latest = own.slice().sort((a,b) => new Date(b.created_at || b.updated_at) - new Date(a.created_at || a.updated_at))[0];
+    id = (match && match.id) || (latest && latest.id) || null;
+  }
+  if (id) await openDocument(id);
   return { data };
+}
+
+async function createNotebookInline(title) {
+  const uid = (state.session && state.session.user && state.session.user.id) ? state.session.user.id : (await awaitSession())?.user?.id;
+  if (!uid) return { error: { message: "Sign in to create notebooks" } };
+  const base = { title, created_by: uid, updated_at: new Date().toISOString() };
+  const payload = state.currentTeamId ? { ...base, team_id: state.currentTeamId } : base;
+  try {
+    const { error } = await client.from("notebooks").insert(payload);
+    if (error) { console.error("createNotebookInline error", error); return { error } }
+  } catch (e) { console.error("createNotebookInline exception", e); return { error: { message: e.message || "Unexpected error" } } }
+  await loadDocuments();
+  const own = state.documents.filter(d => d.created_by === uid);
+  const match = own.find(d => (d.title || "") === title);
+  const id = match && match.id ? match.id : (own.length ? own[0].id : null);
+  if (id) {
+    try { await openDocument(id); } catch (err) { console.error("openDocument error", err); }
+    client.from("notebook_members").insert({ notebook_id: id, user_id: uid, role: "owner" }).then(({ error: memberErr }) => { if (memberErr) console.error("createNotebookInline membership insert error", memberErr); }).catch(err => console.error("createNotebookInline membership insert exception", err));
+  }
+  return { data: { id } };
 }
 
 function renderDocumentsList() {
@@ -265,8 +334,8 @@ function renderDocumentsList() {
     const s = state.filters.search.toLowerCase();
     if (s && !text.includes(s)) return false;
     if (state.filters.groupDocIds && !state.filters.groupDocIds.includes(d.id)) return false;
-    if (state.filters.chip === "Mine" && d.created_by !== state.session.user.id) return false;
-    if (state.filters.chip === "Shared" && d.created_by === state.session.user.id) return false;
+    if (state.filters.chip === "Mine" && state.session && d.created_by !== state.session.user.id) return false;
+    if (state.filters.chip === "Shared" && state.session && d.created_by === state.session.user.id) return false;
     if (state.filters.chip === "Pinned" && !state.pins.includes(d.id)) return false;
     if (state.filters.chip === "Unread") {
       const latestTime = latest ? new Date(latest.created_at) : new Date(d.updated_at || d.created_at);
@@ -345,17 +414,27 @@ async function openDocument(id) {
   navigate("Notes");
   state.selectedDocumentId = id;
   document.getElementById("document-detail").classList.remove("hidden");
-  document.getElementById("documents-list").parentElement.scrollTop = 0;
+  const dl = document.getElementById("documents-list");
+  if (dl && dl.parentElement) dl.parentElement.scrollTop = 0;
   const doc = state.documents.find(x => x.id === id);
-  document.getElementById("document-title").textContent = doc ? (doc.title || "Untitled") : "Document";
+  document.getElementById("document-title").textContent = doc ? (doc.title || "Untitled") : "Notebook";
   markDocOpened(id);
   await loadEntries(id);
+  await loadReactionsForEntries(id);
+  await loadEntryFilesForEntries(id);
   if (state.channels.entries) state.channels.entries.unsubscribe();
   state.channels.entries = client.channel("entries-" + id).on(
     "postgres_changes",
-    { event: "*", schema: "public", table: "entries", filter: "document_id=eq." + id },
+    { event: "*", schema: "public", table: "entries", filter: "notebook_id=eq." + id },
     payload => handleEntryRealtime(payload)
   ).subscribe();
+  if (state.channels.reactions) state.channels.reactions.unsubscribe && state.channels.reactions.unsubscribe();
+  state.channels.reactions = client.channel("reactions-" + id).on(
+    "postgres_changes",
+    { event: "*", schema: "public", table: "entry_reactions" },
+    payload => handleReactionRealtime(payload)
+  ).subscribe();
+  updateBackButton();
 }
 
 function handleEntryRealtime(payload) {
@@ -379,24 +458,55 @@ function handleEntryRealtime(payload) {
 }
 
 async function loadEntries(documentId) {
-  const { data: entries } = await client.from("entries").select("id,document_id,author_id,author_name,author_color,content,created_at,updated_at,is_deleted").eq("document_id", documentId).order("created_at", { ascending: true });
-  state.entries = entries || [];
+  try {
+  const { data, error } = await client.from("entries").select("id,notebook_id,author_id,author_name,author_color,content,created_at,updated_at,is_deleted").eq("notebook_id", documentId).order("created_at", { ascending: false }).limit(50);
+    if (error) { console.error("loadEntries error", error); state.entries = []; }
+    else { state.entries = (data || []).slice().reverse(); }
+  } catch (err) { console.error("loadEntries exception", err); state.entries = []; }
+  state.entriesHasMore = true;
   renderEntriesList();
   const list = document.getElementById("entries-list");
   list.scrollTop = list.scrollHeight;
+}
+
+async function loadOlderEntries() {
+  if (!state.selectedDocumentId || !state.entries.length) return;
+  const oldest = state.entries[0].created_at;
+  const { data } = await client.from("entries").select("id,notebook_id,author_id,author_name,author_color,content,created_at,updated_at,is_deleted").eq("notebook_id", state.selectedDocumentId).lt("created_at", oldest).order("created_at", { ascending: false }).limit(50);
+  const older = (data || []).slice().reverse();
+  if (!older.length) { state.entriesHasMore = false; showToast("No older messages", "success"); return; }
+  state.entries = older.concat(state.entries);
+  renderEntriesList(true);
 }
 
 async function createEntry(documentId, content) {
   if (!content || !content.trim()) return;
   const btn = document.getElementById("btn-add-entry");
   const err = document.getElementById("entry-error");
-  btn.disabled = true; err.classList.add("hidden");
-  const { error } = await client.from("entries").insert({ document_id: documentId, content });
-  if (error) { err.textContent = error.message || "Failed to add entry"; err.classList.remove("hidden"); btn.disabled = false; return; }
+  const prevText = btn.textContent; btn.textContent = "Adding..."; btn.disabled = true; err.classList.add("hidden");
+  const uid = state.session && state.session.user ? state.session.user.id : null;
+  const name = state.profile && state.profile.display_name ? state.profile.display_name : "Author";
+  const color = state.profile && state.profile.color ? state.profile.color : "#888";
+  const { data, error } = await client.from("entries").insert({ notebook_id: documentId, content, author_id: uid, author_name: name, author_color: color }).select("id").single();
+  if (error) { console.error("createEntry error", error); err.textContent = error.message || "Failed to add entry"; err.classList.remove("hidden"); btn.disabled = false; btn.textContent = prevText; return; }
+  const entryId = data && data.id;
+  if (entryId && state.pendingFiles && state.pendingFiles.length) {
+    for (const f of state.pendingFiles) {
+      await client.from("entry_files").insert({ entry_id: entryId, user_id: uid, file_name: f.file_name, file_url: f.file_url });
+    }
+    state.pendingFiles = [];
+    document.getElementById("pending-files").classList.add("hidden");
+    document.getElementById("pending-files").innerHTML = "";
+  }
+  const optimistic = { id: entryId || ("temp-"+Date.now()), notebook_id: documentId, author_id: uid, author_name: name, author_color: color, content, created_at: new Date().toISOString(), is_deleted: false };
+  state.entries.push(optimistic);
+  renderEntriesList();
+  const list = document.getElementById("entries-list");
+  if (state.autoScroll) list.scrollTop = list.scrollHeight;
   const ta = document.getElementById("entry-text");
   ta.value = "";
   document.getElementById("char-count").textContent = "0";
-  btn.disabled = false;
+  btn.disabled = false; btn.textContent = prevText;
 }
 
 async function editEntry(entryId, content) {
@@ -407,10 +517,20 @@ async function softDeleteEntry(entryId) {
   await client.from("entries").update({ is_deleted: true, content: "" }).eq("id", entryId);
 }
 
-function renderEntriesList() {
+function renderEntriesList(keepScroll=false) {
   const list = document.getElementById("entries-list");
   list.innerHTML = "";
-  loadReactions();
+  const topBar = document.createElement("div");
+  topBar.style.display = "flex";
+  topBar.style.justifyContent = "center";
+  if (state.entriesHasMore) {
+    const olderBtn = document.createElement("button");
+    olderBtn.className = "btn";
+    olderBtn.textContent = "Load older messages";
+    olderBtn.addEventListener("click", () => { loadOlderEntries(); });
+    topBar.appendChild(olderBtn);
+  }
+  list.appendChild(topBar);
   for (let i = 0; i < state.entries.length; i++) {
     const e = state.entries[i];
     const item = document.createElement("div");
@@ -433,72 +553,69 @@ function renderEntriesList() {
     time.textContent = humanizeTime(new Date(e.created_at));
     top.appendChild(badge);
     top.appendChild(time);
-  item.appendChild(top);
-  if (e.is_deleted) {
-    const del = document.createElement("div");
-    del.className = "entry-content deleted-placeholder";
-    del.textContent = "Entry deleted by the author";
-    item.appendChild(del);
-  } else if (state.editingEntryId === e.id) {
-    const editor = document.createElement("textarea");
-    editor.className = "field";
-    editor.value = e.content || "";
-    item.appendChild(editor);
-    const actions = document.createElement("div");
-    actions.className = "entry-actions-row";
-    const saveBtn = document.createElement("button");
-    saveBtn.className = "btn primary";
-    saveBtn.textContent = "Save";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "btn";
-    cancelBtn.textContent = "Cancel";
-    saveBtn.addEventListener("click", async () => { await editEntry(e.id, editor.value); state.editingEntryId = null; renderEntriesList(); });
-    cancelBtn.addEventListener("click", () => { state.editingEntryId = null; renderEntriesList(); });
-    actions.appendChild(saveBtn);
-    actions.appendChild(cancelBtn);
-    item.appendChild(actions);
-  } else {
-    const content = document.createElement("div");
-    content.className = "entry-content";
-    content.textContent = e.content || "";
-    item.appendChild(content);
-    const reactRow = document.createElement("div");
-    reactRow.className = "entry-actions-row";
-    const r = state.reactions[e.id] || { up: 0, check: 0, bang: 0 };
-    const btnUp = document.createElement("button");
-    btnUp.className = "small-icon-btn";
-    btnUp.innerHTML = '<svg viewBox="0 0 24 24"><path d="M2 21h4V9H2v12zm20-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L13 1 6.59 7.41C6.22 7.78 6 8.3 6 8.83V19c0 1.1.9 2 2 2h8c.82 0 1.54-.5 1.85-1.26l3.02-7.05c.08-.19.13-.4.13-.62v-2.08z"/></svg>';
-    const upCount = document.createElement("span"); upCount.textContent = String(r.up);
-    btnUp.addEventListener("click", () => { addReaction(e.id, "up"); renderEntriesList(); });
-    const btnCheck = document.createElement("button");
-    btnCheck.className = "small-icon-btn";
-    btnCheck.innerHTML = '<svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
-    const checkCount = document.createElement("span"); checkCount.textContent = String(r.check);
-    btnCheck.addEventListener("click", () => { addReaction(e.id, "check"); renderEntriesList(); });
-    const btnBang = document.createElement("button");
-    btnBang.className = "small-icon-btn";
-    btnBang.innerHTML = '<svg viewBox="0 0 24 24"><path d="M11 7h2v8h-2zm0 10h2v2h-2z"/></svg>';
-    const bangCount = document.createElement("span"); bangCount.textContent = String(r.bang);
-    btnBang.addEventListener("click", () => { addReaction(e.id, "bang"); renderEntriesList(); });
-    reactRow.appendChild(btnUp); reactRow.appendChild(upCount);
-    reactRow.appendChild(btnCheck); reactRow.appendChild(checkCount);
-    reactRow.appendChild(btnBang); reactRow.appendChild(bangCount);
-    item.appendChild(reactRow);
-  }
-    if (!e.is_deleted && state.session && e.author_id === state.session.user.id) {
+    item.appendChild(top);
+    if (e.is_deleted) {
+      const del = document.createElement("div");
+      del.className = "entry-content deleted-placeholder";
+      del.textContent = "Entry deleted by the author";
+      item.appendChild(del);
+    } else if (state.editingEntryId === e.id) {
+      const editor = document.createElement("textarea");
+      editor.className = "field";
+      editor.value = e.content || "";
+      item.appendChild(editor);
+      const actions = document.createElement("div");
+      actions.className = "entry-actions-row";
+      const saveBtn = document.createElement("button");
+      saveBtn.className = "btn primary";
+      saveBtn.textContent = "Save";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "btn";
+      cancelBtn.textContent = "Cancel";
+      saveBtn.addEventListener("click", async () => { await editEntry(e.id, editor.value); state.editingEntryId = null; renderEntriesList(true); });
+      cancelBtn.addEventListener("click", () => { state.editingEntryId = null; renderEntriesList(true); });
+      actions.appendChild(saveBtn);
+      actions.appendChild(cancelBtn);
+      item.appendChild(actions);
+    } else {
+      const content = document.createElement("div");
+      content.className = "entry-content";
+      content.innerHTML = renderMarkdown(e.content || "");
+      item.appendChild(content);
+      const files = state.entryFiles && state.entryFiles[e.id] ? state.entryFiles[e.id] : [];
+      if (files.length) {
+        const fl = document.createElement("div");
+        fl.className = "attachments-list";
+        files.forEach(f => { const link = document.createElement("a"); link.href = f.file_url; link.target = "_blank"; link.textContent = f.file_name; fl.appendChild(link); });
+        item.appendChild(fl);
+      }
       const actions = document.createElement("div");
       actions.className = "entry-actions-row";
       const editBtn = document.createElement("button");
       editBtn.className = "small-icon-btn";
       editBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1.003 1.003 0 000-1.42l-2.34-2.34a1.003 1.003 0 00-1.42 0l-1.83 1.83 3.75 3.75 1.84-1.82z"/></svg>';
-      editBtn.addEventListener("click", async () => { state.editingEntryId = e.id; renderEntriesList(); });
+      editBtn.addEventListener("click", async () => { state.editingEntryId = e.id; renderEntriesList(true); });
       const delBtn = document.createElement("button");
       delBtn.className = "small-icon-btn";
       delBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M6 7h12v2H6zm2 4h8v8H8zM9 4h6l1 2H8l1-2z"/></svg>';
       delBtn.addEventListener("click", async () => { await softDeleteEntry(e.id); });
       actions.appendChild(editBtn);
       actions.appendChild(delBtn);
+      const reactRow = document.createElement("div");
+      reactRow.className = "entry-actions-row";
+      const cnt = state.reactionsCounts[e.id] || { up:0, check:0, bang:0 };
+      const mine = state.reactionsMine[e.id] || {};
+      const btnUp = document.createElement("button"); btnUp.className = "small-icon-btn"; btnUp.innerHTML = '<svg viewBox="0 0 24 24"><path d="M2 21h4V9H2v12zm20-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L13 1 6.59 7.41C6.22 7.78 6 8.3 6 8.83V19c0 1.1.9 2 2 2h8c.82 0 1.54-.5 1.85-1.26l3.02-7.05c.08-.19.13-.4.13-.62v-2.08z"/></svg>'; const upCount = document.createElement("span"); upCount.textContent = String(cnt.up||0); if (mine.up) btnUp.style.background = "#163d2a";
+      btnUp.addEventListener("click", () => toggleReaction(e.id, "up"));
+      const btnCheck = document.createElement("button"); btnCheck.className = "small-icon-btn"; btnCheck.innerHTML = '<svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>'; const checkCount = document.createElement("span"); checkCount.textContent = String(cnt.check||0); if (mine.check) btnCheck.style.background = "#163d2a";
+      btnCheck.addEventListener("click", () => toggleReaction(e.id, "check"));
+      const btnBang = document.createElement("button"); btnBang.className = "small-icon-btn"; btnBang.innerHTML = '<svg viewBox="0 0 24 24"><path d="M11 7h2v8h-2zm0 10h2v2h-2z"/></svg>'; const bangCount = document.createElement("span"); bangCount.textContent = String(cnt.bang||0); if (mine.bang) btnBang.style.background = "#163d2a";
+      btnBang.addEventListener("click", () => toggleReaction(e.id, "bang"));
+      reactRow.appendChild(btnUp); reactRow.appendChild(upCount);
+      reactRow.appendChild(btnCheck); reactRow.appendChild(checkCount);
+      reactRow.appendChild(btnBang); reactRow.appendChild(bangCount);
       item.appendChild(actions);
+      item.appendChild(reactRow);
     }
     list.appendChild(item);
   }
@@ -527,11 +644,26 @@ function bindUI() {
     const el = document.getElementById("new-doc-error");
     const title = input.value.trim();
     if (!title) { el.textContent = "Enter a title"; el.classList.remove("hidden"); return; }
-    btn.disabled = true; el.classList.add("hidden");
-    const res = await createDocumentInline(title);
-    if (res.error) { el.textContent = res.error.message || "Failed to create"; el.classList.remove("hidden"); btn.disabled = false; return; }
-    el.textContent = "Created"; el.classList.remove("hidden"); el.classList.add("success");
-    setTimeout(() => { document.getElementById("new-doc-modal").classList.add("hidden"); el.classList.remove("success"); el.classList.add("hidden"); btn.disabled = false; }, 600);
+    const prevText = btn.textContent; btn.textContent = "Creating..."; btn.disabled = true; el.classList.add("hidden");
+    const guard = setTimeout(() => { try { if (btn.disabled) { btn.disabled = false; btn.textContent = prevText; el.textContent = "Request timed out"; el.classList.remove("hidden"); } } catch (_) {} }, 10000);
+    try {
+      const res = await createNotebookInline(title);
+      if (res && res.error) {
+        console.error("New notebook create error", res.error);
+        el.textContent = res.error.message || "Failed to create";
+        el.classList.remove("hidden");
+      } else {
+        document.getElementById("new-doc-modal").classList.add("hidden");
+        showToast("Notebook created", "success");
+      }
+    } catch (err) {
+      console.error("Create notebook handler exception", err);
+      el.textContent = (err && err.message) ? err.message : "Failed to create";
+      el.classList.remove("hidden");
+    } finally {
+      clearTimeout(guard);
+      btn.disabled = false; btn.textContent = prevText;
+    }
   });
   document.getElementById("btn-camera").addEventListener("click", () => {
     document.getElementById("quick-note-text").value = "";
@@ -554,8 +686,17 @@ function bindUI() {
     const content = document.getElementById("quick-note-text").value;
     const target = document.getElementById("quick-note-doc").value || state.selectedDocumentId;
     if (!target) { const el = document.getElementById("quick-note-error"); el.textContent = "Choose a document"; el.classList.remove("hidden"); return; }
-    const { error } = await client.from("entries").insert({ document_id: target, content });
-    if (error) { const el = document.getElementById("quick-note-error"); el.textContent = error.message || "Failed"; el.classList.remove("hidden"); return; }
+    const uid = state.session && state.session.user ? state.session.user.id : null;
+    const name = state.profile && state.profile.display_name ? state.profile.display_name : "Author";
+    const color = state.profile && state.profile.color ? state.profile.color : "#888";
+    const { data, error } = await client.from("entries").insert({ notebook_id: target, content, author_id: uid, author_name: name, author_color: color }).select("id").single();
+    if (error) { console.error("quick-note add error", error); const el = document.getElementById("quick-note-error"); el.textContent = error.message || "Failed"; el.classList.remove("hidden"); return; }
+    if (state.selectedDocumentId === target) {
+      const optimistic = { id: data && data.id ? data.id : ("temp-"+Date.now()), notebook_id: target, author_id: uid, author_name: name, author_color: color, content, created_at: new Date().toISOString(), is_deleted: false };
+      state.entries.push(optimistic);
+      renderEntriesList();
+      const list = document.getElementById("entries-list"); if (state.autoScroll) list.scrollTop = list.scrollHeight;
+    }
     document.getElementById("quick-note-modal").classList.add("hidden");
   });
   document.getElementById("btn-menu").addEventListener("click", () => {
@@ -566,8 +707,34 @@ function bindUI() {
   const homeBtn = document.getElementById("btn-home");
   if (homeBtn) homeBtn.addEventListener("click", () => { goHome(); });
   document.getElementById("menu-signout").addEventListener("click", async () => {
-    document.getElementById("menu-panel").classList.add("hidden");
-    await client.auth.signOut();
+    const panel = document.getElementById("menu-panel");
+    const btn = document.getElementById("menu-signout");
+    panel.classList.add("hidden");
+    const prev = btn.textContent; btn.textContent = "Signing out..."; btn.disabled = true;
+    try {
+      await client.auth.signOut({ scope: "global" });
+    } catch (err) {
+      console.error("signOut error", err);
+      showToast((err && err.message) ? err.message : "Sign out failed", "error");
+    }
+    try {
+      if (state.channels.docs) state.channels.docs.unsubscribe();
+      if (state.channels.entries) state.channels.entries.unsubscribe();
+      if (state.channels.reactions) state.channels.reactions.unsubscribe && state.channels.reactions.unsubscribe();
+    } catch (_) {}
+    state.session = null;
+    state.selectedDocumentId = null;
+    document.getElementById("document-detail").classList.add("hidden");
+    showAuth();
+    btn.disabled = false; btn.textContent = prev;
+    try {
+      const { data } = await client.auth.getSession();
+      if (data && data.session) {
+        try { await client.auth.signOut({ scope: "local" }); } catch (_) {}
+        clearSupabaseAuthStorage();
+        setTimeout(() => { window.location.reload(); }, 100);
+      }
+    } catch (_) {}
   });
   document.getElementById("btn-back").addEventListener("click", () => {
     state.selectedDocumentId = null;
@@ -581,13 +748,15 @@ function bindUI() {
     const d = state.documents.find(x => x.id === state.selectedDocumentId);
     if (d) {
       const creator = state.session && d.created_by === state.session.user.id;
-      let html = "<div>Document ID: " + d.id + "</div><div>Created by: " + d.created_by + "</div><div>Created at: " + new Date(d.created_at).toLocaleString() + "</div>";
+      let html = "<div>Notebook ID: " + d.id + "</div><div>Created by: " + d.created_by + "</div><div>Created at: " + new Date(d.created_at).toLocaleString() + "</div>";
       const tags = (state.tags && state.tags[d.id]) ? state.tags[d.id] : [];
       html += '<div style="margin-top:8px">Tags: ' + (tags.map(t => '#'+t).join(' ')) + '</div>';
       if (creator) {
         html += '<div style="margin-top:8px;display:flex;gap:8px"><button id="btn-rename-doc" class="btn">Rename</button><button id="btn-delete-doc" class="btn">Delete</button><button id="btn-export-doc" class="btn">Export .md</button></div>';
         html += '<div style="margin-top:8px"><input id="tags-input" class="field" placeholder="Add tags comma-separated"><button id="tags-save" class="btn" style="margin-top:6px">Save Tags</button></div>';
+        html += '<div style="margin-top:12px"><div style="font-weight:700;margin-bottom:6px">Share</div><div id="members-list"></div><div style="display:flex;gap:6px;margin-top:6px"><input id="share-email" class="field" placeholder="Invite by email"><select id="share-role" class="field"><option value="viewer">Viewer</option><option value="editor" selected>Editor</option></select><button id="share-invite" class="btn">Invite</button></div></div>';
       } else {
+        html += '<div style="margin-top:12px"><div style="font-weight:700;margin-bottom:6px">Members</div><div id="members-list"></div></div>';
         html += '<div style="margin-top:8px;display:flex;gap:8px"><button id="btn-export-doc" class="btn">Export .md</button></div>';
       }
       panel.innerHTML = html;
@@ -608,9 +777,22 @@ function bindUI() {
             renderDocumentsList();
           });
         }
+        const inviteBtn = document.getElementById("share-invite");
+        if (inviteBtn) inviteBtn.addEventListener("click", async () => {
+          const email = document.getElementById("share-email").value.trim();
+          const role = document.getElementById("share-role").value;
+          if (!email) { showToast("Enter an email", "error"); return; }
+          const { data: user } = await client.from("users").select("id").eq("email", email).maybeSingle();
+          if (!user) { showToast("User not found", "error"); return; }
+          const { error } = await client.from("notebook_members").insert({ notebook_id: d.id, user_id: user.id, role });
+          if (error) { showToast(error.message || "Invite failed", "error"); return; }
+          showToast("Invited", "success");
+          await renderMembersSection(d.id);
+        });
       }
       const ex = document.getElementById("btn-export-doc");
       if (ex) ex.addEventListener("click", async () => { await exportDocumentMarkdown(d.id); });
+      renderMembersSection(d.id);
     }
   });
   document.getElementById("search-input").addEventListener("input", e => {
@@ -651,6 +833,33 @@ function bindUI() {
   document.getElementById("nav-activity").addEventListener("click", () => navigate("Activity"));
   document.getElementById("nav-groups").addEventListener("click", () => navigate("Groups"));
   document.getElementById("nav-settings").addEventListener("click", () => navigate("Settings"));
+  const teamSel = document.getElementById("team-selector");
+  if (teamSel) {
+    teamSel.addEventListener("change", async () => { state.currentTeamId = teamSel.value || null; await loadDocuments(); });
+  }
+  const attachBtn = document.getElementById("btn-attach-file");
+  const attachInput = document.getElementById("attach-file-input");
+  if (attachBtn && attachInput) {
+    attachBtn.addEventListener("click", () => attachInput.click());
+    attachInput.addEventListener("change", async () => {
+      if (!attachInput.files || !attachInput.files.length) return;
+      const file = attachInput.files[0];
+      const uid = state.session && state.session.user ? state.session.user.id : null;
+      if (!uid) { showToast("Sign in to attach files", "error"); return; }
+      const path = uid + "/" + Date.now() + "-" + file.name;
+      const { data, error } = await client.storage.from("notes-files").upload(path, file);
+      if (error) { showToast(error.message || "Upload failed", "error"); return; }
+      const pub = client.storage.from("notes-files").getPublicUrl(path);
+      const pf = { file_name: file.name, file_url: pub.data.publicUrl };
+      state.pendingFiles.push(pf);
+      const pfBox = document.getElementById("pending-files");
+      pfBox.classList.remove("hidden");
+      const a = document.createElement("a"); a.href = pf.file_url; a.target = "_blank"; a.textContent = pf.file_name;
+      if (!pfBox.firstChild) { pfBox.textContent = "Pending attachments: "; }
+      pfBox.appendChild(a);
+      attachInput.value = "";
+    });
+  }
 }
 
 function randomColor() {
@@ -690,13 +899,24 @@ document.addEventListener("DOMContentLoaded", () => {
   loadPreferences();
   loadPins();
   loadTags();
-  loadReactions();
   bindUI();
   initAuth();
 });
 
 function storageWorks() {
   try { localStorage.setItem("__sn_test__", "1"); localStorage.removeItem("__sn_test__"); return true; } catch (_) { return false; }
+}
+
+function clearSupabaseAuthStorage() {
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      if (k.startsWith("sb-") || k.includes("supabase.auth")) keys.push(k);
+    }
+    keys.forEach(k => localStorage.removeItem(k));
+  } catch (_) {}
 }
 
 async function awaitSession(timeoutMs=3000, intervalMs=200) {
@@ -710,7 +930,7 @@ async function awaitSession(timeoutMs=3000, intervalMs=200) {
 }
 
 async function renameDocument(id, title) {
-  await client.from("documents").update({ title, updated_at: new Date().toISOString() }).eq("id", id);
+  await client.from("notebooks").update({ title, updated_at: new Date().toISOString() }).eq("id", id);
   await loadDocuments();
   if (state.selectedDocumentId === id) document.getElementById("document-title").textContent = title;
 }
@@ -720,7 +940,7 @@ async function deleteDocument(id) {
     const ok = confirm("Delete this document?");
     if (!ok) return;
   }
-  await client.from("documents").delete().eq("id", id);
+  await client.from("notebooks").delete().eq("id", id);
   await loadDocuments();
   document.getElementById("document-detail").classList.add("hidden");
 }
@@ -797,15 +1017,28 @@ async function renderActivityView() {
   title.style.marginBottom = "8px";
   title.textContent = "Recent Entries";
   wrap.appendChild(title);
+  const docSel = document.createElement("select");
+  docSel.className = "field";
+  const optAll = document.createElement("option"); optAll.value = ""; optAll.textContent = "All documents"; docSel.appendChild(optAll);
+  state.documents.forEach(d => { const o = document.createElement("option"); o.value = d.id; o.textContent = d.title || "Untitled"; docSel.appendChild(o); });
+  docSel.value = state.activityDocId || "";
+  docSel.addEventListener("change", () => { state.activityDocId = docSel.value || null; renderActivityView(); });
+  wrap.appendChild(docSel);
   const filt = document.createElement("div");
   filt.className = "chips-row";
-  const mk = (label, key) => { const b = document.createElement("button"); b.className = "chip" + ((key==="all" && !state.activityFilters.mine && !state.activityFilters.range) ? " active" : ""); b.textContent = label; b.addEventListener("click", () => { if (key==="mine") state.activityFilters.mine = true; else state.activityFilters.mine = false; if (key==="24h") state.activityFilters.range = "24h"; else if (key==="7d") state.activityFilters.range = "7d"; else state.activityFilters.range = null; renderActivityView(); }); return b; };
+  const mk = (label, key) => { const active = (key==="all" && !state.activityFilters.mine && !state.activityFilters.range) || (key==="mine" && state.activityFilters.mine) || (key==="24h" && state.activityFilters.range === "24h") || (key==="7d" && state.activityFilters.range === "7d"); const b = document.createElement("button"); b.className = "chip" + (active ? " active" : ""); b.textContent = label; b.addEventListener("click", () => { if (key==="mine") state.activityFilters.mine = true; else state.activityFilters.mine = false; if (key==="24h") state.activityFilters.range = "24h"; else if (key==="7d") state.activityFilters.range = "7d"; else state.activityFilters.range = null; renderActivityView(); }); return b; };
   filt.appendChild(mk("All", "all"));
   filt.appendChild(mk("Mine", "mine"));
   filt.appendChild(mk("24h", "24h"));
   filt.appendChild(mk("7d", "7d"));
   wrap.appendChild(filt);
-  const { data: recent } = await client.from("entries").select("id,document_id,author_id,author_name,author_color,content,created_at").order("created_at", { ascending: false }).limit(50);
+  let recent = [];
+  try {
+  let q = client.from("entries").select("id,notebook_id,author_id,author_name,author_color,content,created_at").order("created_at", { ascending: false }).limit(50);
+  if (docSel.value) q = q.eq("notebook_id", docSel.value);
+    const { data, error } = await q;
+    if (error) { console.error("Activity load error", error); } else { recent = data || []; }
+  } catch (err) { console.error("Activity load exception", err); }
   const ul = document.createElement("ul");
   ul.style.listStyle = "none";
   ul.style.margin = "0";
@@ -842,10 +1075,10 @@ async function renderActivityView() {
     li.appendChild(top);
     const content = document.createElement("div");
     content.className = "entry-content";
-    const doc = docMap.get(e.document_id);
+    const doc = docMap.get(e.notebook_id);
     content.textContent = (doc ? (doc.title || "Untitled") + " – " : "") + (e.content || "");
     li.appendChild(content);
-    li.addEventListener("click", () => openDocument(e.document_id));
+    li.addEventListener("click", () => openDocument(e.notebook_id));
     ul.appendChild(li);
   });
   wrap.appendChild(ul);
@@ -1089,7 +1322,7 @@ function loadLastOpened() { try { const raw = localStorage.getItem("sn_last_open
 function saveLastOpened() { try { localStorage.setItem("sn_last_opened", JSON.stringify(state.lastOpened)); } catch (_) {} }
 function markDocOpened(id) { loadLastOpened(); state.lastOpened[id] = new Date().toISOString(); saveLastOpened(); }
 async function exportDocumentMarkdown(id) {
-  const { data: entries } = await client.from("entries").select("author_name,content,created_at").eq("document_id", id).order("created_at", { ascending: true });
+  const { data: entries } = await client.from("entries").select("author_name,content,created_at").eq("notebook_id", id).order("created_at", { ascending: true });
   const doc = state.documents.find(x => x.id === id);
   const lines = [];
   lines.push("# " + (doc ? (doc.title || "Untitled") : "Document"));
@@ -1110,3 +1343,115 @@ async function exportDocumentMarkdown(id) {
 }
   const ndt = document.getElementById("new-doc-title");
   if (ndt) ndt.addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("new-doc-create").click(); });
+  document.querySelectorAll(".modal").forEach(m => {
+    m.addEventListener("click", e => { if (e.target === m) m.classList.add("hidden"); });
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") document.querySelectorAll(".modal").forEach(m => m.classList.add("hidden"));
+  });
+async function loadTeams() {
+  const { data: teams } = await client.from("teams").select("id,name");
+  state.teams = teams || [];
+  const sel = document.getElementById("team-selector");
+  if (sel) {
+    sel.innerHTML = "";
+    const opt = document.createElement("option"); opt.value = ""; opt.textContent = "Personal"; sel.appendChild(opt);
+    state.teams.forEach(t => { const o = document.createElement("option"); o.value = t.id; o.textContent = t.name; sel.appendChild(o); });
+    sel.value = state.currentTeamId || "";
+  }
+}
+
+async function renderMembersSection(docId) {
+  const listEl = document.getElementById("members-list");
+  if (!listEl) return;
+  listEl.innerHTML = "Loading members...";
+  const { data: members } = await client.from("notebook_members").select("id,notebook_id,user_id,role").eq("notebook_id", docId);
+  const ids = (members || []).map(m => m.user_id);
+  const { data: users } = ids.length ? await client.from("users").select("id,display_name,email,color").in("id", ids) : { data: [] };
+  const map = new Map((users || []).map(u => [u.id, u]));
+  const isOwner = !!(state.session && members && members.find(m => m.user_id === state.session.user.id && m.role === "owner"));
+  listEl.innerHTML = "";
+  (members || []).forEach(m => {
+    const row = document.createElement("div");
+    row.style.display = "flex"; row.style.alignItems = "center"; row.style.justifyContent = "space-between"; row.style.gap = "8px"; row.style.marginBottom = "6px";
+    const left = document.createElement("div");
+    const u = map.get(m.user_id);
+    left.textContent = ((u && u.display_name) || m.user_id) + (u && u.email ? (" (" + u.email + ")") : "");
+    const right = document.createElement("div");
+    if (isOwner) {
+      const roleSel = document.createElement("select"); roleSel.className = "field"; ["viewer","editor","owner"].forEach(r => { const o = document.createElement("option"); o.value = r; o.textContent = r; roleSel.appendChild(o); }); roleSel.value = m.role;
+      roleSel.addEventListener("change", async () => { await client.from("notebook_members").update({ role: roleSel.value }).eq("id", m.id); showToast("Role updated", "success"); });
+      const remBtn = document.createElement("button"); remBtn.className = "btn"; remBtn.textContent = "Remove"; remBtn.addEventListener("click", async () => { await client.from("notebook_members").delete().eq("id", m.id); showToast("Removed", "success"); await renderMembersSection(docId); });
+      right.appendChild(roleSel); right.appendChild(remBtn);
+    } else {
+      right.textContent = m.role;
+    }
+    row.appendChild(left); row.appendChild(right);
+    listEl.appendChild(row);
+  });
+}
+
+async function loadReactionsForEntries(documentId) {
+  const ids = state.entries.map(e => e.id);
+  if (!ids.length) { state.reactionsCounts = {}; state.reactionsMine = {}; return; }
+  const { data: reacts } = await client.from("entry_reactions").select("entry_id,user_id,kind").in("entry_id", ids);
+  const counts = {}; const mine = {};
+  const uid = state.session && state.session.user ? state.session.user.id : null;
+  (reacts || []).forEach(r => {
+    counts[r.entry_id] = counts[r.entry_id] || { up:0, check:0, bang:0 };
+    counts[r.entry_id][r.kind] = (counts[r.entry_id][r.kind]||0) + 1;
+    if (uid && r.user_id === uid) { mine[r.entry_id] = mine[r.entry_id] || {}; mine[r.entry_id][r.kind] = true; }
+  });
+  state.reactionsCounts = counts; state.reactionsMine = mine;
+}
+
+async function toggleReaction(entryId, kind) {
+  const uid = state.session && state.session.user ? state.session.user.id : null;
+  if (!uid) { showToast("Sign in to react", "error"); return; }
+  const mine = state.reactionsMine[entryId] && state.reactionsMine[entryId][kind];
+  if (mine) {
+    await client.from("entry_reactions").delete().eq("entry_id", entryId).eq("user_id", uid).eq("kind", kind);
+  } else {
+    await client.from("entry_reactions").insert({ entry_id: entryId, user_id: uid, kind });
+  }
+  await loadReactionsForEntries(state.selectedDocumentId);
+  renderEntriesList(true);
+}
+
+function handleReactionRealtime(payload) {
+  if (!state.selectedDocumentId) return;
+  loadReactionsForEntries(state.selectedDocumentId).then(() => { renderEntriesList(true); });
+}
+
+async function loadEntryFilesForEntries(documentId) {
+  const ids = state.entries.map(e => e.id);
+  if (!ids.length) { state.entryFiles = {}; return; }
+  const { data } = await client.from("entry_files").select("id,entry_id,file_name,file_url").in("entry_id", ids);
+  const map = {};
+  (data || []).forEach(f => { if (!map[f.entry_id]) map[f.entry_id] = []; map[f.entry_id].push(f); });
+  state.entryFiles = map;
+}
+
+function renderMarkdown(text) {
+  if (!text) return "";
+  const esc = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let s = esc;
+  s = s.replace(/^######\s?(.*)$/gm, '<h6>$1</h6>')
+       .replace(/^#####\s?(.*)$/gm, '<h5>$1</h5>')
+       .replace(/^####\s?(.*)$/gm, '<h4>$1</h4>')
+       .replace(/^###\s?(.*)$/gm, '<h3>$1</h3>')
+       .replace(/^##\s?(.*)$/gm, '<h2>$1</h2>')
+       .replace(/^#\s?(.*)$/gm, '<h1>$1</h1>')
+       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+       .replace(/\*(.*?)\*/g, '<em>$1</em>')
+       .replace(/`([^`]+)`/g, '<code>$1</code>')
+       .replace(/\[(.*?)\]\((https?:[^\)]+)\)/g, '<a href="$2" target="_blank">$1</a>')
+       .replace(/\n/g, '<br/>');
+  return s;
+}
+
+function showToast(message, type) {
+  const t = document.getElementById("toast"); if (!t) return;
+  t.textContent = message; t.classList.remove("hidden"); t.classList.remove("success","error"); if (type) t.classList.add(type);
+  setTimeout(() => { t.classList.add("hidden"); }, 2000);
+}
