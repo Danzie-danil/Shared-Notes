@@ -24,10 +24,16 @@
 
 <div id="app-screen" class="screen hidden">
   <div class="top-bar">
+    <button id="btn-nav-back" class="icon-btn hidden">
+      <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
     <button id="btn-menu" class="icon-btn">
       <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
     </button>
     <div class="top-actions">
+      <button id="btn-home" class="icon-btn">
+        <svg viewBox="0 0 24 24"><path d="M12 3l9 8h-3v10H6V11H3l9-8z"/></svg>
+      </button>
       <button id="btn-camera" class="icon-btn">
         <svg viewBox="0 0 24 24"><path d="M9 3h6l2 3h3v15H4V6h3l2-3zm3 4a6 6 0 100 12 6 6 0 000-12z"/></svg>
       </button>
@@ -53,6 +59,8 @@
         <button class="chip" data-chip="Shared">Shared</button>
         <button class="chip" data-chip="Today">Today</button>
         <button class="chip" data-chip="This Week">This Week</button>
+        <button class="chip" data-chip="Pinned">Pinned</button>
+        <button class="chip" data-chip="Unread">Unread</button>
       </div>
     </div>
     <ul id="documents-list" class="documents-list"></ul>
@@ -133,6 +141,7 @@
   <div id="quick-note-modal" class="modal hidden">
     <div class="modal-card">
       <div class="modal-title">Quick Note</div>
+      <select id="quick-note-doc" class="field"></select>
       <textarea id="quick-note-text" rows="3" placeholder="Write a quick note..."></textarea>
       <div id="quick-note-error" class="alert hidden"></div>
       <div class="modal-actions">

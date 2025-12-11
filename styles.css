@@ -342,3 +342,19 @@ body {
   .auth-card { margin-top: 16vh; }
   .bottom-nav { left: 20%; right: 20%; }
 }
+
+/* Compact layout adjustments */
+.compact .doc-item { padding: 8px; gap: 8px; }
+.compact .search-bar { padding: 6px 8px; }
+.compact .chip { padding: 6px 10px; }
+.compact .entry { padding: 8px 10px; }
+.compact .entry-input { padding: 8px 10px; }
+.compact .modal-card { padding: 12px; }
+.compact .top-bar { padding: 8px; }
+.unread-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #e74c3c;
+  margin-left: 6px;
+}
